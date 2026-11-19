@@ -1,0 +1,323 @@
+---
+title: "STAR Alignment with Reference Genome"
+author: "Mason Gorrondona"
+date: "2026-11-13"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+## Step 1 Check CONDA on the HPC and your Storage
+Log into the HPC and run:
+```{bash}
+conda --version
+```
+If it prints a version, move on to step two, otherwise redo the Miniforge installation from Rachel's tutorial
+
+Check storage with:
+```{bash}
+quota -s
+df -h ~
+```
+
+
+
+## Step 2 Make a STAR Environment
+```{bash}
+conda create -n acer_star \
+    --override-channels -c conda-forge -c bioconda --strict-channel-priority \
+    star samtools pandas multiqc
+conda activate acer_star
+STAR --version && samtools --version | head -1
+```
+Write down the versions so you will have them when preparing a manuscript
+
+## Step 3 get your trimmed reads onto your HPC
+First make a destination for your reads in the hpc
+```{bash}
+mkdir -p ~/acer_survival/trimmed_reads
+```
+
+
+To move from your laptop to the hpc, use rsync
+
+```{bash}
+
+rsync -avhz  path/to/local/<target file>/ mxg3231@hpcr8o2rnp.uta.edu:/home/mxg3231/acer_survival/trimmed_reads/
+
+```
+If your data is in the coral immune server, log in there and run the rsync
+
+## Step 4 get your reference genome and annotation on to the HPC
+Should be in FASTA and GTF format
+Make directory in HPC
+```{bash}
+mkdir -p ~/acer_survival/reference
+```
+
+Use rsync again
+```{bash}
+rsync -avhz  path/to/local/<target file>/ mxg3231@hpcr8o2rnp.uta.edu:/home/mxg3231/acer_survival/reference
+```
+
+## Step 5 Upload BASH scripts to HPC
+
+Copy these scripts into and save as .sbatch with the corresponding file names
+config:
+```{bash}
+#!/usr/bin/env bash
+# Edit these paths once; every script sources this file.
+export PROJ=${PROJ:-$HOME/acer_survival}
+export READS_DIR=/path/to/trimmed_reads          # folder with *_fp_R1.fq.gz / *_fp_R2.fq.gz and *_fastp.json
+export GENOME_FA=/path/to/Acer_genome.fasta
+export GTF=/path/to/Acer_genes.gtf
+export STAR_INDEX=$PROJ/ref/star_index
+export OUT=$PROJ/star_out
+export SAMPLES=$PROJ/samples.tsv
+export THREADS=8
+
+# Activate the conda environment (tools: STAR, samtools, python+pandas)
+set +u   # conda's activate scripts can trip over 'set -u'
+source "$HOME/miniforge3/etc/profile.d/conda.sh"   # change if Miniforge lives elsewhere
+conda activate acer_star
+set -u
+mkdir -p "$PROJ" "$PROJ/logs" "$OUT" "$(dirname "$STAR_INDEX")"
+
+```
+00_make_samplesheet:
+```{bash}
+#!/usr/bin/env bash
+# Builds samples.tsv from the trimmed reads and records the read length for STAR's --sjdbOverhang.
+set -euo pipefail
+source "$(dirname "$0")/config.sh"
+
+printf "sample\ttimepoint\tr1\tr2\n" > "$SAMPLES"
+for r1 in "$READS_DIR"/*_fp_R1.fq.gz; do
+  s=$(basename "$r1" _fp_R1.fq.gz)
+  [[ "$s" == PBL_* ]] && continue   # March 2025 samples excluded for now; remove this line to include them
+  r2="$READS_DIR/${s}_fp_R2.fq.gz"
+  [[ -f "$r2" ]] || { echo "MISSING R2 for $s" >&2; continue; }
+  # ASSUMPTION: BL_* = October 2024 (peak bleaching), PBL_* = March 2025. Confirm against metadata.
+  case "$s" in PBL_*) tp=Mar2025;; BL_*) tp=Oct2024;; *) tp=unknown;; esac
+  printf "%s\t%s\t%s\t%s\n" "$s" "$tp" "$r1" "$r2" >> "$SAMPLES"
+done
+echo "Samples: $(tail -n +2 "$SAMPLES" | wc -l)"
+tail -n +2 "$SAMPLES" | cut -f2 | sort | uniq -c
+
+# Original (pre-trim) read length from fastp JSON -> max over samples
+python3 - <<'EOF' > "$PROJ/read_len.txt"
+import glob, json, os
+L = []
+for f in glob.glob(os.path.join(os.environ["READS_DIR"], "BL_*_fastp.json")):
+    d = json.load(open(f))
+    L.append(int(round(d["summary"]["before_filtering"]["read1_mean_length"])))
+print(max(L))
+EOF
+echo "Max read length: $(cat "$PROJ/read_len.txt")  (sjdbOverhang will be this minus 1)"
+
+```
+
+01_star_index:
+```{bash}
+#!/usr/bin/env bash
+#SBATCH --job-name=star_index
+#SBATCH -p short
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=48G
+#SBATCH --time=04:00:00
+#SBATCH --output=logs/star_index_%j.out
+#SBATCH --error=logs/star_index_%j.err
+set -euo pipefail
+source "${SLURM_SUBMIT_DIR:-$(dirname "$0")}/config.sh"   # submit from the star_pipeline folder
+
+READ_LEN=$(cat "$PROJ/read_len.txt")
+OVERHANG=$((READ_LEN - 1))
+
+# STAR recommends min(14, log2(GenomeLength)/2 - 1); matters a lot for small genomes
+GENOME_LEN=$(awk '!/^>/{n+=length($0)} END{print n}' "$GENOME_FA")
+SA=$(awk -v n="$GENOME_LEN" 'BEGIN{v=log(n)/log(2)/2-1; if(v>14)v=14; printf "%d", v}')
+echo "Genome length: $GENOME_LEN  SAindexNbases: $SA  sjdbOverhang: $OVERHANG"
+
+# If STAR errors on the GTF (no exon/gene_id), see README note: your GTF may use different attribute names.
+STAR --runMode genomeGenerate \
+     --runThreadN "$THREADS" \
+     --genomeDir "$STAR_INDEX" \
+     --genomeFastaFiles "$GENOME_FA" \
+     --sjdbGTFfile "$GTF" \
+     --sjdbOverhang "$OVERHANG" \
+     --genomeSAindexNbases "$SA" \
+     --outFileNamePrefix "$PROJ/ref/index_"
+
+```
+
+02_star_align:
+```{bash}
+#!/usr/bin/env bash
+#SBATCH --job-name=star_align
+#SBATCH -p short
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=32G
+#SBATCH --time=06:00:00
+#SBATCH --array=1-48%10
+#SBATCH --output=logs/star_align_%A_%a.out
+#SBATCH --error=logs/star_align_%A_%a.err
+# Resize the array to your sample count, e.g.:
+#   sbatch --array=1-$(($(wc -l < samples.tsv)-1))%10 02_star_align.sbatch
+# Test on one sample first:  sbatch --array=1 02_star_align.sbatch
+set -euo pipefail
+source "${SLURM_SUBMIT_DIR:-$(dirname "$0")}/config.sh"   # submit from the star_pipeline folder
+
+LINE=$(sed -n "$((SLURM_ARRAY_TASK_ID + 1))p" "$SAMPLES")
+[[ -n "$LINE" ]] || { echo "No sample for task $SLURM_ARRAY_TASK_ID"; exit 0; }
+IFS=$'\t' read -r SAMPLE TP R1 R2 <<< "$LINE"
+
+SDIR="$OUT/$SAMPLE"
+mkdir -p "$SDIR"
+if [[ -f "$SDIR/${SAMPLE}.ReadsPerGene.out.tab" && -f "$SDIR/${SAMPLE}.Log.final.out" ]]; then
+  echo "$SAMPLE already done, skipping"; exit 0
+fi
+
+TMP=${TMPDIR:-/tmp}/star_${SAMPLE}_$$
+trap 'rm -rf "$TMP"' EXIT   # STAR requires that --outTmpDir does not exist yet
+
+STAR --runThreadN "$THREADS" \
+     --genomeDir "$STAR_INDEX" \
+     --readFilesIn "$R1" "$R2" \
+     --readFilesCommand zcat \
+     --outFileNamePrefix "$SDIR/${SAMPLE}." \
+     --outTmpDir "$TMP" \
+     --outSAMtype BAM SortedByCoordinate \
+     --outSAMattributes NH HI AS nM \
+     --quantMode GeneCounts \
+     --outFilterMultimapNmax 20 \
+     --outFilterMismatchNoverReadLmax 0.04 \
+     --alignSJoverhangMin 8 \
+     --alignIntronMax 100000
+
+# samtools index "$SDIR/${SAMPLE}.Aligned.sortedByCoord.out.bam"   # uncomment if samtools is loaded
+echo "Finished $SAMPLE"
+
+```
+
+03_merge_counts:
+```{bash}
+#!/usr/bin/env python3
+"""Merge STAR ReadsPerGene.out.tab files into one gene x sample counts matrix (for DESeq2)
+and summarise mapping rates from Log.final.out.
+
+Usage: python3 03_merge_counts.py <star_out_dir> <output_prefix>
+STAR's ReadsPerGene has 3 count columns: 2 = unstranded, 3 = read 1 matches gene strand,
+4 = read 1 opposite to gene strand. The right column is the one with the most assigned reads
+across samples; it is chosen automatically and the evidence is printed so you can sanity-check.
+"""
+import glob, os, re, sys
+import pandas as pd
+
+star_dir, prefix = sys.argv[1], sys.argv[2]
+files = sorted(glob.glob(os.path.join(star_dir, "*", "*.ReadsPerGene.out.tab")))
+if not files:
+    sys.exit("No ReadsPerGene files found")
+
+cols, totals = {}, {2: 0, 3: 0, 4: 0}
+for f in files:
+    s = os.path.basename(f).replace(".ReadsPerGene.out.tab", "")
+    df = pd.read_csv(f, sep="\t", header=None, index_col=0)
+    genes = df[~df.index.str.startswith("N_")]
+    cols[s] = genes
+    for i, c in enumerate([1, 2, 3], start=2):
+        totals[i] += genes[c].sum()
+
+best = max(totals, key=totals.get)
+print("Assigned reads by strandedness column (2=unstranded, 3=forward, 4=reverse):", totals)
+if sorted(totals.values())[-1] < 1.5 * sorted(totals.values())[-2]:
+    print("NOTE: columns 2 and the best stranded column are similar -> library is likely unstranded; using column 2.")
+    best = 2
+print(f"Using column {best}")
+
+mat = pd.DataFrame({s: d[best - 1] for s, d in cols.items()})
+mat.index.name = "gene_id"
+mat.to_csv(f"{prefix}_counts.tsv", sep="\t")
+print(f"Wrote {prefix}_counts.tsv  ({mat.shape[0]} genes x {mat.shape[1]} samples)")
+
+# Mapping QC
+rows = []
+for f in sorted(glob.glob(os.path.join(star_dir, "*", "*.Log.final.out"))):
+    s = os.path.basename(f).replace(".Log.final.out", "")
+    txt = open(f).read()
+    def g(key):
+        m = re.search(re.escape(key) + r"\s*\|\s*([\d.]+)", txt)
+        return float(m.group(1)) if m else None
+    rows.append({"sample": s,
+                 "input_reads": g("Number of input reads"),
+                 "uniq_map_pct": g("Uniquely mapped reads %"),
+                 "multi_map_pct": g("% of reads mapped to multiple loci")})
+qc = pd.DataFrame(rows)
+qc["assigned_to_gene"] = [mat[s].sum() if s in mat else None for s in qc["sample"]]
+qc.to_csv(f"{prefix}_mapping_qc.tsv", sep="\t", index=False)
+print(f"Wrote {prefix}_mapping_qc.tsv")
+print(qc.describe().loc[["min", "mean", "max"]].round(1).to_string())
+
+```
+
+Save all of these to a folder on your laptop named star_pipeline
+
+rysnc to the HPC
+```{bash}
+rsync -avhP /mnt/c/users/Mason/Downloads/star_pipeline mxg3231@hpcr8o2rnp.uta.edu:/home/mxg3231/acer_survival/star_pipeline
+
+```
+## Step 6 edit config.sh on the HPC
+cd to the star_pipeline folder
+```{bash}
+nano config.sh
+```
+
+Change these to match actual file names:
+READS_DIR=/home/<netID>/acer_survival/trimmed_reads
+GENOME_FA=/home/<netID>/acer_survival/ref/genome.fasta
+GTF=/home/<netID>/acer_survival/ref/annotation.gtf
+
+Ensure the miniforge path is correct as well
+
+## Step 7 build the sample sheet
+```{bash}
+mkdir -p logs
+bash 00_make_samplesheet.sh
+```
+
+## Step 8 build the STAR index
+```{bash}
+sbatch 01_star_index.sbatch
+squeue -u $USER
+tail logs/star_index_*.out
+```
+
+Ensure ~/acer_survival/ref/star_index now contains files like SA and Genome
+
+## Step 9 test on one sample
+```{bash}
+sbatch --array=1 02_star_align.sbatch
+```
+
+Open ~/acer_survival/star_out/<Sample_name>.Log.final.out and check Uniquely mapped reads %
+60-90% ideal, if lower it may be due to an incorrect reference or symbiont reads BLAST can check for this
+
+## Step 10 run all samples
+```{bash}
+N=$(( $(wc -l < ~/acer_survival/samples.tsv) - 1 ))
+sbatch --array=1-${N}%10 02_star_align.sbatch
+```
+
+%10 runs 10 at a time. Check progress with squeue -u $USER. Resubmitting is safe, because finished samples are skipped. Look at failures in logs/star_align_*.err.
+
+## Step 11 merge the counts
+
+```{bash}
+python3 03_merge_counts.py ~/acer_survival/star_out ~/acer_survival/acer
+```
+
+Gives you acer_counts.tsv and acer_mapping_qc.tsv which you should save to your laptop via rsync to use for DESeq analysis
